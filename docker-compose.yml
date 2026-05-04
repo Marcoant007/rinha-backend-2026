@@ -1,16 +1,14 @@
 services:
 
   knn:
-    build:
-      context: .
-      dockerfile: Dockerfile.knn
+    image: ghcr.io/marcoant007/rinha-backend-2026-knn:latest
     networks:
       - backend
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8080/ready"]
       interval: 5s
       timeout: 3s
-      retries: 60 
+      retries: 60
       start_period: 10s
     deploy:
       resources:
@@ -19,9 +17,7 @@ services:
           memory: "220MB"
 
   api1:
-    build:
-      context: .
-      dockerfile: Dockerfile.api
+    image: ghcr.io/marcoant007/rinha-backend-2026-api:latest
     environment:
       - KNN_SERVICE_URL=http://knn:8080
       - PORT=8081
@@ -37,9 +33,7 @@ services:
           memory: "60MB"
 
   api2:
-    build:
-      context: .
-      dockerfile: Dockerfile.api
+    image: ghcr.io/marcoant007/rinha-backend-2026-api:latest
     environment:
       - KNN_SERVICE_URL=http://knn:8080
       - PORT=8081

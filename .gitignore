@@ -1,8 +1,0 @@
-/knn
-/api
-
-resources/references.json.gz
-
-*.exe
-*.test
-*.out
