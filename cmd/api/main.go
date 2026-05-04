@@ -22,6 +22,7 @@ var (
 	labels  []bool
 	numRefs int
 	ready   bool
+	sem     = make(chan struct{}, 2)
 )
 
 type refJSON struct {
@@ -218,7 +219,9 @@ func handleFraudScore(w http.ResponseWriter, r *http.Request) {
 	}
 
 	vec := vectorize.Vectorize(&req)
+	sem <- struct{}{}
 	fraudCount := knn5(vec)
+	<-sem
 	fraudScore := float64(fraudCount) / 5.0
 
 	w.Header().Set("Content-Type", "application/json")
