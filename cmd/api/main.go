@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"sync"
+	"sync/atomic"
 
 	"github.com/Marcoant007/rinha-2026/internal/models"
 	"github.com/Marcoant007/rinha-2026/internal/vectorize"
@@ -18,11 +19,11 @@ const (
 )
 
 var (
-	vectors []uint8
-	labels  []bool
-	numRefs int
-	ready   bool
-	sem     = make(chan struct{}, 2)
+	vectors   []uint8
+	labels    []bool
+	numRefs   int
+	dataReady int32 // atomic: 0=loading, 1=ready
+	sem       = make(chan struct{}, 2)
 )
 
 type refJSON struct {
@@ -70,7 +71,7 @@ func loadReferences(path string) error {
 	}
 
 	numRefs = len(labels)
-	ready = true
+	atomic.StoreInt32(&dataReady, 1)
 	log.Printf("Carregados %d vetores de referência.\n", numRefs)
 	return nil
 }
@@ -199,7 +200,7 @@ func siftDown(h *[5]neighbor, i int) {
 }
 
 func handleReady(w http.ResponseWriter, r *http.Request) {
-	if !ready {
+	if atomic.LoadInt32(&dataReady) == 0 {
 		http.Error(w, "loading", http.StatusServiceUnavailable)
 		return
 	}
@@ -209,6 +210,11 @@ func handleReady(w http.ResponseWriter, r *http.Request) {
 func handleFraudScore(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if atomic.LoadInt32(&dataReady) == 0 {
+		http.Error(w, "loading", http.StatusServiceUnavailable)
 		return
 	}
 
@@ -237,14 +243,16 @@ func main() {
 		refsPath = "/data/references.json.gz"
 	}
 
-	if err := loadReferences(refsPath); err != nil {
-		log.Fatalf("Erro ao carregar referências: %v", err)
-	}
-
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8081"
 	}
+
+	go func() {
+		if err := loadReferences(refsPath); err != nil {
+			log.Fatalf("Erro ao carregar referências: %v", err)
+		}
+	}()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ready", handleReady)

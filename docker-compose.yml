@@ -8,12 +8,6 @@ services:
       - PORT=8081
     networks:
       - backend
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8081/ready"]
-      interval: 5s
-      timeout: 3s
-      retries: 30
-      start_period: 20s
     deploy:
       resources:
         limits:
@@ -28,12 +22,6 @@ services:
       - PORT=8081
     networks:
       - backend
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8081/ready"]
-      interval: 5s
-      timeout: 3s
-      retries: 30
-      start_period: 20s
     deploy:
       resources:
         limits:

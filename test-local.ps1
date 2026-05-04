@@ -18,7 +18,27 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-Start-Sleep -Seconds 2
+Write-Host ""
+Write-Host "=== Aguardando APIs carregarem dados (GET /ready) ==="
+$maxWait = 60
+$elapsed = 0
+do {
+    Start-Sleep -Seconds 2
+    $elapsed += 2
+    try {
+        $r = $null
+        $r = Invoke-WebRequest -Uri "http://127.0.0.1:9999/ready" -UseBasicParsing -ErrorAction SilentlyContinue
+    } catch { $r = $null }
+    $status = if ($r) { $r.StatusCode } else { 0 }
+    Write-Host "  /ready: $status ($elapsed s)"
+} while ($status -ne 200 -and $elapsed -lt $maxWait)
+
+if ($status -ne 200) {
+    Write-Host "FALHOU: APIs não ficaram prontas em $maxWait segundos"
+    docker compose -p $PROJECT -f "$SCRIPT_DIR\docker-compose.yml" logs
+    Cleanup
+    exit 1
+}
 
 Write-Host ""
 Write-Host "=== Testando POST /fraud-score na porta 9999 ==="
