@@ -9,7 +9,8 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 FROM alpine:3.21
 RUN apk add --no-cache ca-certificates
 COPY --from=builder /api /api
+COPY resources/references.json.gz /data/references.json.gz
+ENV REFS_PATH=/data/references.json.gz
 ENV PORT=8081
-ENV KNN_SERVICE_URL=http://knn:8080
 EXPOSE 8081
 ENTRYPOINT ["/api"]
