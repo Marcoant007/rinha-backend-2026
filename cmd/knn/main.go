@@ -6,17 +6,22 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sync"
 
 	"github.com/Marcoant007/rinha-2026/internal/models"
 )
 
-const dims = 14
+const (
+	dims       = 14
+	numWorkers = 4
+)
 
 var (
 	vectors []float32
 	labels  []bool
 	numRefs int
 	ready   bool
+	sem     = make(chan struct{}, 2)
 )
 
 type refJSON struct {
@@ -70,11 +75,11 @@ type neighbor struct {
 	isFraud bool
 }
 
-func knn5(query []float64) [5]neighbor {
+func scanChunk(query []float64, start, end int) [5]neighbor {
 	var heap [5]neighbor
 	heapSize := 0
 
-	for i := 0; i < numRefs; i++ {
+	for i := start; i < end; i++ {
 		base := i * dims
 
 		var sq float32
@@ -95,7 +100,51 @@ func knn5(query []float64) [5]neighbor {
 		}
 	}
 
+	for heapSize < 5 {
+		heap[heapSize] = neighbor{float32(1e38), false}
+		heapSize++
+	}
+
 	return heap
+}
+
+func knn5(query []float64) [5]neighbor {
+	chunkSize := numRefs / numWorkers
+	results := make([][5]neighbor, numWorkers)
+
+	var wg sync.WaitGroup
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func(workerIdx int) {
+			defer wg.Done()
+			start := workerIdx * chunkSize
+			end := start + chunkSize
+			if workerIdx == numWorkers-1 {
+				end = numRefs
+			}
+			results[workerIdx] = scanChunk(query, start, end)
+		}(w)
+	}
+	wg.Wait()
+
+	// Merge: pega os 5 menores dentre os 4×5 candidatos
+	all := make([]neighbor, 0, numWorkers*5)
+	for _, h := range results {
+		all = append(all, h[:]...)
+	}
+
+	var final [5]neighbor
+	for i := 0; i < 5; i++ {
+		minIdx := i
+		for j := i + 1; j < len(all); j++ {
+			if all[j].dist < all[minIdx].dist {
+				minIdx = j
+			}
+		}
+		final[i] = all[minIdx]
+		all[i], all[minIdx] = all[minIdx], all[i]
+	}
+	return final
 }
 
 func buildMaxHeap(h *[5]neighbor) {
@@ -150,7 +199,9 @@ func handleKNN(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	sem <- struct{}{}
 	neighbors := knn5(req.Vector)
+	<-sem
 
 	fraudCount := 0
 	for _, n := range neighbors {

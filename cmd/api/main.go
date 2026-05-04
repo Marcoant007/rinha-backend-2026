@@ -13,7 +13,7 @@ import (
 )
 
 var knnServiceURL string
-var httpClient = &http.Client{Timeout: 5 * time.Second}
+var httpClient = &http.Client{Timeout: 30 * time.Second}
 
 func handleReady(w http.ResponseWriter, r *http.Request) {
 	resp, err := httpClient.Get(knnServiceURL + "/ready")
