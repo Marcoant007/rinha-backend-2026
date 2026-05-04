@@ -30,6 +30,12 @@ services:
     depends_on:
       knn:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8081/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
     deploy:
       resources:
         limits:
@@ -48,6 +54,12 @@ services:
     depends_on:
       knn:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8081/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
     deploy:
       resources:
         limits:
@@ -63,8 +75,10 @@ services:
     networks:
       - backend
     depends_on:
-      - api1
-      - api2
+      api1:
+        condition: service_healthy
+      api2:
+        condition: service_healthy
     deploy:
       resources:
         limits:
