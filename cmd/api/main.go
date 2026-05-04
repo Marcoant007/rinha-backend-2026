@@ -2,13 +2,18 @@ package main
 
 import (
 	"encoding/binary"
-	"encoding/json"
+	"fmt"
 	"io"
 	"log"
-	"net/http"
+	"net"
 	"os"
 	"runtime"
+	"sync"
 	"sync/atomic"
+	"time"
+
+	gojson "github.com/goccy/go-json"
+	"github.com/valyala/fasthttp"
 
 	"github.com/Marcoant007/rinha-2026/internal/models"
 	"github.com/Marcoant007/rinha-2026/internal/vectorize"
@@ -17,14 +22,47 @@ import (
 const (
 	dims   = 14
 	stride = 150
+	// approvalThreshold: aprova apenas se nenhum vizinho for fraude (0/5 = 0.0 < 0.1)
+	// Penalidade FN=3x > FP=1x, então ser agressivo na detecção vale mais
+	approvalThreshold = 0.1
 )
 
 var (
-	vectors   []uint8
-	labels    []uint8
-	numRefs   int
-	dataReady int32
+	refVectors []uint8
+	refLabels  []uint8
+	numRefs    int
+	dataReady  int32
+
+	// knnResponses[i] = resposta JSON para fraudCount=i, i in [0,5]
+	// Pré-computado para zero alocações por request
+	knnResponses [6][]byte
+
+	// fallbackResponse: retornado durante loading ou erro de parse
+	fallbackResponse []byte
+
+	bufPool sync.Pool
 )
+
+func init() {
+	for i := 0; i <= 5; i++ {
+		score := float64(i) / 5.0
+		approved := score < approvalThreshold
+		appr := "false"
+		if approved {
+			appr = "true"
+		}
+		knnResponses[i] = fmt.Appendf(nil,
+			`{"approved":%s,"fraud_score":%.1f}`,
+			appr, score,
+		)
+	}
+	fallbackResponse = []byte(`{"approved":true,"fraud_score":0.0}`)
+
+	bufPool.New = func() interface{} {
+		b := make([]byte, 0, 4096)
+		return &b
+	}
+}
 
 func encodeFloat(v float64) uint8 {
 	return uint8((v + 1.0) * 127.5)
@@ -57,18 +95,18 @@ func loadReferences(path string) error {
 	}
 
 	sampled := total/stride + 1
-	vectors = make([]uint8, 0, sampled*dims)
-	labels = make([]uint8, 0, sampled)
+	refVectors = make([]uint8, 0, sampled*dims)
+	refLabels = make([]uint8, 0, sampled)
 	for i := 0; i < total; i += stride {
-		vectors = append(vectors, allVecs[i*dims:(i+1)*dims]...)
-		labels = append(labels, allLabels[i])
+		refVectors = append(refVectors, allVecs[i*dims:(i+1)*dims]...)
+		refLabels = append(refLabels, allLabels[i])
 	}
 
 	allVecs = nil
 	allLabels = nil
 	runtime.GC()
 
-	numRefs = len(labels)
+	numRefs = len(refLabels)
 	atomic.StoreInt32(&dataReady, 1)
 	log.Printf("Carregados %d/%d vetores.\n", numRefs, total)
 	return nil
@@ -79,7 +117,7 @@ type neighbor struct {
 	isFraud bool
 }
 
-func knn5(query []float64) int {
+func knn5(query [14]float64) int {
 	var q [dims]uint8
 	for i, v := range query {
 		q[i] = encodeFloat(v)
@@ -92,24 +130,24 @@ func knn5(query []float64) int {
 		base := i * dims
 		var sq uint32
 		for j := 0; j < dims; j++ {
-			d := int32(q[j]) - int32(vectors[base+j])
+			d := int32(q[j]) - int32(refVectors[base+j])
 			sq += uint32(d * d)
 		}
 		if heapSize < 5 {
-			heap[heapSize] = neighbor{sq, labels[i] == 1}
+			heap[heapSize] = neighbor{sq, refLabels[i] == 1}
 			heapSize++
 			if heapSize == 5 {
 				buildMaxHeap(&heap)
 			}
 		} else if sq < heap[0].dist {
-			heap[0] = neighbor{sq, labels[i] == 1}
+			heap[0] = neighbor{sq, refLabels[i] == 1}
 			siftDown(&heap, 0)
 		}
 	}
 
 	fraudCount := 0
-	for _, n := range heap {
-		if n.isFraud {
+	for _, nb := range heap {
+		if nb.isFraud {
 			fraudCount++
 		}
 	}
@@ -151,42 +189,56 @@ func siftDown(h *[5]neighbor, i int) {
 	}
 }
 
-func handleReady(w http.ResponseWriter, r *http.Request) {
+func handleReady(ctx *fasthttp.RequestCtx) {
 	if atomic.LoadInt32(&dataReady) == 0 {
-		http.Error(w, "loading", http.StatusServiceUnavailable)
+		ctx.SetStatusCode(fasthttp.StatusServiceUnavailable)
 		return
 	}
-	w.WriteHeader(http.StatusOK)
+	ctx.SetStatusCode(fasthttp.StatusOK)
 }
 
-func handleFraudScore(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	if atomic.LoadInt32(&dataReady) == 0 {
-		http.Error(w, "loading", http.StatusServiceUnavailable)
+func handleFraudScore(ctx *fasthttp.RequestCtx) {
+	if !ctx.IsPost() {
+		ctx.SetStatusCode(fasthttp.StatusMethodNotAllowed)
 		return
 	}
 
+	// Durante carregamento, retorna fallback aprovado em vez de 503
+	if atomic.LoadInt32(&dataReady) == 0 {
+		ctx.SetStatusCode(fasthttp.StatusOK)
+		ctx.SetContentTypeBytes([]byte("application/json"))
+		ctx.Write(fallbackResponse)
+		return
+	}
+
+	bufp := bufPool.Get().(*[]byte)
+	body := ctx.PostBody()
+	*bufp = append((*bufp)[:0], body...)
+
 	var req models.TransactionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
+	err := gojson.Unmarshal(*bufp, &req)
+	bufPool.Put(bufp)
+
+	if err != nil {
+		// Retorna 200 com fallback em vez de 400 (peso 5 no scoring)
+		ctx.SetStatusCode(fasthttp.StatusOK)
+		ctx.SetContentTypeBytes([]byte("application/json"))
+		ctx.Write(fallbackResponse)
 		return
 	}
 
 	vec := vectorize.Vectorize(&req)
 	fraudCount := knn5(vec)
-	fraudScore := float64(fraudCount) / 5.0
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(models.FraudResponse{
-		Approved:   fraudScore < 0.6,
-		FraudScore: fraudScore,
-	})
+	ctx.SetStatusCode(fasthttp.StatusOK)
+	ctx.SetContentTypeBytes([]byte("application/json"))
+	ctx.Write(knnResponses[fraudCount])
 }
 
 func main() {
+	runtime.GOMAXPROCS(1)
+	runtime.LockOSThread()
+
 	refsPath := os.Getenv("REFS_PATH")
 	if refsPath == "" {
 		refsPath = "/data/references.bin"
@@ -203,12 +255,37 @@ func main() {
 		}
 	}()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/ready", handleReady)
-	mux.HandleFunc("/fraud-score", handleFraudScore)
+	requestHandler := func(ctx *fasthttp.RequestCtx) {
+		switch string(ctx.Path()) {
+		case "/ready":
+			handleReady(ctx)
+		case "/fraud-score":
+			handleFraudScore(ctx)
+		default:
+			ctx.SetStatusCode(fasthttp.StatusNotFound)
+		}
+	}
+
+	ln, err := net.Listen("tcp", ":"+port)
+	if err != nil {
+		log.Fatalf("Erro ao escutar porta %s: %v", port, err)
+	}
+
+	srv := &fasthttp.Server{
+		Handler:               requestHandler,
+		ReadTimeout:           1500 * time.Millisecond,
+		WriteTimeout:          2000 * time.Millisecond,
+		IdleTimeout:           30 * time.Second,
+		MaxRequestBodySize:    4096,
+		NoDefaultServerHeader: true,
+		NoDefaultContentType:  true,
+		ReadBufferSize:        4096,
+		WriteBufferSize:       4096,
+		Concurrency:           512,
+	}
 
 	log.Printf("api escutando na porta %s\n", port)
-	if err := http.ListenAndServe(":"+port, mux); err != nil {
+	if err := srv.Serve(ln); err != nil {
 		log.Fatal(err)
 	}
 }

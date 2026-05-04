@@ -34,8 +34,8 @@ func clamp(v float64) float64 {
 	return math.Max(0.0, math.Min(1.0, v))
 }
 
-func Vectorize(req *models.TransactionRequest) []float64 {
-	vec := make([]float64, 14)
+func Vectorize(req *models.TransactionRequest) [14]float64 {
+	var vec [14]float64
 
 	vec[0] = clamp(req.Transaction.Amount / maxAmount)
 
