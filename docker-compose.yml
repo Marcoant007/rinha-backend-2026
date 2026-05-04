@@ -1,70 +1,44 @@
 services:
 
-  knn:
-    build:
-      context: .
-      dockerfile: Dockerfile.knn
-    networks:
-      - backend
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8080/ready"]
-      interval: 5s
-      timeout: 3s
-      retries: 60 
-      start_period: 10s
-    deploy:
-      resources:
-        limits:
-          cpus: "0.50"
-          memory: "220MB"
-
   api1:
     build:
       context: .
       dockerfile: Dockerfile.api
     environment:
-      - KNN_SERVICE_URL=http://knn:8080
       - PORT=8081
     networks:
       - backend
-    depends_on:
-      knn:
-        condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8081/ready"]
       interval: 5s
       timeout: 3s
-      retries: 10
-      start_period: 5s
+      retries: 30
+      start_period: 20s
     deploy:
       resources:
         limits:
-          cpus: "0.225"
-          memory: "60MB"
+          cpus: "0.45"
+          memory: "165MB"
 
   api2:
     build:
       context: .
       dockerfile: Dockerfile.api
     environment:
-      - KNN_SERVICE_URL=http://knn:8080
       - PORT=8081
     networks:
       - backend
-    depends_on:
-      knn:
-        condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8081/ready"]
       interval: 5s
       timeout: 3s
-      retries: 10
-      start_period: 5s
+      retries: 30
+      start_period: 20s
     deploy:
       resources:
         limits:
-          cpus: "0.225"
-          memory: "60MB"
+          cpus: "0.45"
+          memory: "165MB"
 
   nginx:
     image: nginx:1.27-alpine
@@ -75,10 +49,8 @@ services:
     networks:
       - backend
     depends_on:
-      api1:
-        condition: service_healthy
-      api2:
-        condition: service_healthy
+      - api1
+      - api2
     deploy:
       resources:
         limits:
