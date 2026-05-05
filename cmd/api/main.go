@@ -10,7 +10,6 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	gojson "github.com/goccy/go-json"
 	"github.com/valyala/fasthttp"
@@ -42,9 +41,6 @@ var (
 
 	bufPool sync.Pool
 
-	// sem limita concorrência do KNN; quando cheio retorna fallback imediato
-	// evita que requests fiquem na fila até o timeout de 2001ms
-	sem = make(chan struct{}, 6)
 )
 
 func init() {
@@ -232,26 +228,15 @@ func handleFraudScore(ctx *fasthttp.RequestCtx) {
 	}
 
 	vec := vectorize.Vectorize(&req)
+	fraudCount := knn5(vec)
 
-	// Tenta adquirir slot para KNN; se cheio, retorna fallback imediatamente
-	// Isso evita que requests fiquem na fila até o timeout de 2001ms
-	select {
-	case sem <- struct{}{}:
-		fraudCount := knn5(vec)
-		<-sem
-		ctx.SetStatusCode(fasthttp.StatusOK)
-		ctx.SetContentTypeBytes([]byte("application/json"))
-		ctx.Write(knnResponses[fraudCount])
-	default:
-		ctx.SetStatusCode(fasthttp.StatusOK)
-		ctx.SetContentTypeBytes([]byte("application/json"))
-		ctx.Write(fallbackResponse)
-	}
+	ctx.SetStatusCode(fasthttp.StatusOK)
+	ctx.SetContentTypeBytes([]byte("application/json"))
+	ctx.Write(knnResponses[fraudCount])
 }
 
 func main() {
-	runtime.GOMAXPROCS(1)
-	runtime.LockOSThread()
+	runtime.GOMAXPROCS(2)
 
 	refsPath := os.Getenv("REFS_PATH")
 	if refsPath == "" {
@@ -287,15 +272,12 @@ func main() {
 
 	srv := &fasthttp.Server{
 		Handler:               requestHandler,
-		ReadTimeout:           1500 * time.Millisecond,
-		WriteTimeout:          2000 * time.Millisecond,
-		IdleTimeout:           30 * time.Second,
 		MaxRequestBodySize:    4096,
 		NoDefaultServerHeader: true,
 		NoDefaultContentType:  true,
 		ReadBufferSize:        4096,
 		WriteBufferSize:       4096,
-		Concurrency:           512,
+		Concurrency:           256,
 	}
 
 	log.Printf("api escutando na porta %s\n", port)
