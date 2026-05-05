@@ -20,7 +20,7 @@ var (
 	labels    []uint8
 	numRefs   int
 	dataReady int32
-	sem       = make(chan struct{}, 1)
+	sem       = make(chan struct{}, 4)
 )
 
 func encodeFloat(v float64) uint8 {
