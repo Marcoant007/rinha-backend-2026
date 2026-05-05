@@ -7,20 +7,23 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"runtime"
 	"sync/atomic"
 
 	"github.com/Marcoant007/rinha-2026/internal/models"
 	"github.com/Marcoant007/rinha-2026/internal/vectorize"
 )
 
-const dims = 14
+const (
+	dims   = 14
+	stride = 150
+)
 
 var (
 	vectors   []uint8
 	labels    []uint8
 	numRefs   int
 	dataReady int32
-	sem       = make(chan struct{}, 4)
 )
 
 func encodeFloat(v float64) uint8 {
@@ -41,19 +44,33 @@ func loadReferences(path string) error {
 		return err
 	}
 
-	vectors = make([]uint8, int(n)*dims)
-	if _, err := io.ReadFull(f, vectors); err != nil {
+	total := int(n)
+
+	allVecs := make([]uint8, total*dims)
+	if _, err := io.ReadFull(f, allVecs); err != nil {
 		return err
 	}
 
-	labels = make([]uint8, n)
-	if _, err := io.ReadFull(f, labels); err != nil {
+	allLabels := make([]uint8, total)
+	if _, err := io.ReadFull(f, allLabels); err != nil {
 		return err
 	}
 
-	numRefs = int(n)
+	sampled := total/stride + 1
+	vectors = make([]uint8, 0, sampled*dims)
+	labels = make([]uint8, 0, sampled)
+	for i := 0; i < total; i += stride {
+		vectors = append(vectors, allVecs[i*dims:(i+1)*dims]...)
+		labels = append(labels, allLabels[i])
+	}
+
+	allVecs = nil
+	allLabels = nil
+	runtime.GC()
+
+	numRefs = len(labels)
 	atomic.StoreInt32(&dataReady, 1)
-	log.Printf("Carregados %d vetores.\n", numRefs)
+	log.Printf("Carregados %d/%d vetores.\n", numRefs, total)
 	return nil
 }
 
@@ -159,9 +176,7 @@ func handleFraudScore(w http.ResponseWriter, r *http.Request) {
 	}
 
 	vec := vectorize.Vectorize(&req)
-	sem <- struct{}{}
 	fraudCount := knn5(vec)
-	<-sem
 	fraudScore := float64(fraudCount) / 5.0
 
 	w.Header().Set("Content-Type", "application/json")

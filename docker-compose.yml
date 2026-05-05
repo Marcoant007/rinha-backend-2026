@@ -1,9 +1,7 @@
 services:
 
   api1:
-    build:
-      context: .
-      dockerfile: Dockerfile.api
+    image: ghcr.io/marcoant007/rinha-backend-2026-api:v7
     environment:
       - PORT=8081
     networks:
@@ -15,9 +13,7 @@ services:
           memory: "165MB"
 
   api2:
-    build:
-      context: .
-      dockerfile: Dockerfile.api
+    image: ghcr.io/marcoant007/rinha-backend-2026-api:v7
     environment:
       - PORT=8081
     networks:
