@@ -1,38 +1,29 @@
 package main
 
 import (
-	"compress/gzip"
+	"encoding/binary"
 	"encoding/json"
+	"io"
 	"log"
 	"net/http"
 	"os"
-	"sync"
 	"sync/atomic"
 
 	"github.com/Marcoant007/rinha-2026/internal/models"
 	"github.com/Marcoant007/rinha-2026/internal/vectorize"
 )
 
-const (
-	dims       = 14
-	numWorkers = 4
-)
+const dims = 14
 
 var (
 	vectors   []uint8
-	labels    []bool
+	labels    []uint8
 	numRefs   int
-	dataReady int32 // atomic: 0=loading, 1=ready
-	sem       = make(chan struct{}, 2)
+	dataReady int32
+	sem       = make(chan struct{}, 1)
 )
 
-type refJSON struct {
-	Vector [dims]float64 `json:"vector"`
-	Label  string        `json:"label"`
-}
-
 func encodeFloat(v float64) uint8 {
-	// Map [-1, 1] → [0, 255]
 	return uint8((v + 1.0) * 127.5)
 }
 
@@ -43,36 +34,26 @@ func loadReferences(path string) error {
 	}
 	defer f.Close()
 
-	gz, err := gzip.NewReader(f)
-	if err != nil {
-		return err
-	}
-	defer gz.Close()
+	log.Println("Carregando vetores de referência (binário)...")
 
-	log.Println("Carregando vetores de referência...")
-
-	dec := json.NewDecoder(gz)
-	if _, err := dec.Token(); err != nil {
+	var n uint32
+	if err := binary.Read(f, binary.LittleEndian, &n); err != nil {
 		return err
 	}
 
-	vectors = make([]uint8, 0, 3_000_000*dims)
-	labels = make([]bool, 0, 3_000_000)
-
-	var r refJSON
-	for dec.More() {
-		if err := dec.Decode(&r); err != nil {
-			return err
-		}
-		for _, v := range r.Vector {
-			vectors = append(vectors, encodeFloat(v))
-		}
-		labels = append(labels, r.Label == "fraud")
+	vectors = make([]uint8, int(n)*dims)
+	if _, err := io.ReadFull(f, vectors); err != nil {
+		return err
 	}
 
-	numRefs = len(labels)
+	labels = make([]uint8, n)
+	if _, err := io.ReadFull(f, labels); err != nil {
+		return err
+	}
+
+	numRefs = int(n)
 	atomic.StoreInt32(&dataReady, 1)
-	log.Printf("Carregados %d vetores de referência.\n", numRefs)
+	log.Printf("Carregados %d vetores.\n", numRefs)
 	return nil
 }
 
@@ -81,82 +62,36 @@ type neighbor struct {
 	isFraud bool
 }
 
-func scanChunk(query [dims]uint8, start, end int) [5]neighbor {
-	var heap [5]neighbor
-	heapSize := 0
-
-	for i := start; i < end; i++ {
-		base := i * dims
-
-		var sq uint32
-		for j := 0; j < dims; j++ {
-			d := int32(query[j]) - int32(vectors[base+j])
-			sq += uint32(d * d)
-		}
-
-		if heapSize < 5 {
-			heap[heapSize] = neighbor{sq, labels[i]}
-			heapSize++
-			if heapSize == 5 {
-				buildMaxHeap(&heap)
-			}
-		} else if sq < heap[0].dist {
-			heap[0] = neighbor{sq, labels[i]}
-			siftDown(&heap, 0)
-		}
-	}
-
-	for heapSize < 5 {
-		heap[heapSize] = neighbor{^uint32(0), false}
-		heapSize++
-	}
-
-	return heap
-}
-
 func knn5(query []float64) int {
 	var q [dims]uint8
 	for i, v := range query {
 		q[i] = encodeFloat(v)
 	}
 
-	chunkSize := numRefs / numWorkers
-	results := make([][5]neighbor, numWorkers)
+	var heap [5]neighbor
+	heapSize := 0
 
-	var wg sync.WaitGroup
-	for w := 0; w < numWorkers; w++ {
-		wg.Add(1)
-		go func(workerIdx int) {
-			defer wg.Done()
-			start := workerIdx * chunkSize
-			end := start + chunkSize
-			if workerIdx == numWorkers-1 {
-				end = numRefs
-			}
-			results[workerIdx] = scanChunk(q, start, end)
-		}(w)
-	}
-	wg.Wait()
-
-	all := make([]neighbor, 0, numWorkers*5)
-	for _, h := range results {
-		all = append(all, h[:]...)
-	}
-
-	var final [5]neighbor
-	for i := 0; i < 5; i++ {
-		minIdx := i
-		for j := i + 1; j < len(all); j++ {
-			if all[j].dist < all[minIdx].dist {
-				minIdx = j
-			}
+	for i := 0; i < numRefs; i++ {
+		base := i * dims
+		var sq uint32
+		for j := 0; j < dims; j++ {
+			d := int32(q[j]) - int32(vectors[base+j])
+			sq += uint32(d * d)
 		}
-		final[i] = all[minIdx]
-		all[i], all[minIdx] = all[minIdx], all[i]
+		if heapSize < 5 {
+			heap[heapSize] = neighbor{sq, labels[i] == 1}
+			heapSize++
+			if heapSize == 5 {
+				buildMaxHeap(&heap)
+			}
+		} else if sq < heap[0].dist {
+			heap[0] = neighbor{sq, labels[i] == 1}
+			siftDown(&heap, 0)
+		}
 	}
 
 	fraudCount := 0
-	for _, n := range final {
+	for _, n := range heap {
 		if n.isFraud {
 			fraudCount++
 		}
@@ -212,7 +147,6 @@ func handleFraudScore(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-
 	if atomic.LoadInt32(&dataReady) == 0 {
 		http.Error(w, "loading", http.StatusServiceUnavailable)
 		return
@@ -240,7 +174,7 @@ func handleFraudScore(w http.ResponseWriter, r *http.Request) {
 func main() {
 	refsPath := os.Getenv("REFS_PATH")
 	if refsPath == "" {
-		refsPath = "/data/references.json.gz"
+		refsPath = "/data/references.bin"
 	}
 
 	port := os.Getenv("PORT")

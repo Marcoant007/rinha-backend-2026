@@ -3,14 +3,15 @@ WORKDIR /app
 COPY go.mod ./
 RUN go mod download
 COPY . .
+RUN CGO_ENABLED=0 go run ./cmd/convert resources/references.json.gz references.bin
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -ldflags="-s -w" -o /api ./cmd/api
 
 FROM alpine:3.21
 RUN apk add --no-cache ca-certificates
 COPY --from=builder /api /api
-COPY resources/references.json.gz /data/references.json.gz
-ENV REFS_PATH=/data/references.json.gz
+COPY --from=builder /app/references.bin /data/references.bin
+ENV REFS_PATH=/data/references.bin
 ENV PORT=8081
 EXPOSE 8081
 ENTRYPOINT ["/api"]
