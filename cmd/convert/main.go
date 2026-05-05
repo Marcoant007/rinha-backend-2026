@@ -41,28 +41,22 @@ func main() {
 		log.Fatal(err)
 	}
 
-	const keepEvery = 10 // usa 1/10 dos vetores → ~300K
-
-	vecs := make([]uint8, 0, 300_000*dims)
-	lbls := make([]uint8, 0, 300_000)
+	vecs := make([]uint8, 0, 3_000_000*dims)
+	lbls := make([]uint8, 0, 3_000_000)
 
 	var r refJSON
-	idx := 0
 	for dec.More() {
 		if err := dec.Decode(&r); err != nil {
 			log.Fatal(err)
 		}
-		if idx%keepEvery == 0 {
-			for _, v := range r.Vector {
-				vecs = append(vecs, encodeFloat(v))
-			}
-			lbl := uint8(0)
-			if r.Label == "fraud" {
-				lbl = 1
-			}
-			lbls = append(lbls, lbl)
+		for _, v := range r.Vector {
+			vecs = append(vecs, encodeFloat(v))
 		}
-		idx++
+		lbl := uint8(0)
+		if r.Label == "fraud" {
+			lbl = 1
+		}
+		lbls = append(lbls, lbl)
 	}
 
 	out, err := os.Create(os.Args[2])
