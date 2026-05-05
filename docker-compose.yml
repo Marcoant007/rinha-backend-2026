@@ -1,7 +1,7 @@
 services:
 
   api1:
-    image: ghcr.io/marcoant007/rinha-backend-2026-api:v8
+    image: ghcr.io/marcoant007/rinha-backend-2026-api:v9
     environment:
       - PORT=8081
     networks:
@@ -13,7 +13,7 @@ services:
           memory: "165MB"
 
   api2:
-    image: ghcr.io/marcoant007/rinha-backend-2026-api:v8
+    image: ghcr.io/marcoant007/rinha-backend-2026-api:v9
     environment:
       - PORT=8081
     networks:
