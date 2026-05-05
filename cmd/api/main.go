@@ -37,10 +37,14 @@ var (
 	// Pré-computado para zero alocações por request
 	knnResponses [6][]byte
 
-	// fallbackResponse: retornado durante loading ou erro de parse
+	// fallbackResponse: retornado durante loading, erro de parse ou sobrecarga
 	fallbackResponse []byte
 
 	bufPool sync.Pool
+
+	// sem limita concorrência do KNN; quando cheio retorna fallback imediato
+	// evita que requests fiquem na fila até o timeout de 2001ms
+	sem = make(chan struct{}, 6)
 )
 
 func init() {
@@ -228,11 +232,21 @@ func handleFraudScore(ctx *fasthttp.RequestCtx) {
 	}
 
 	vec := vectorize.Vectorize(&req)
-	fraudCount := knn5(vec)
 
-	ctx.SetStatusCode(fasthttp.StatusOK)
-	ctx.SetContentTypeBytes([]byte("application/json"))
-	ctx.Write(knnResponses[fraudCount])
+	// Tenta adquirir slot para KNN; se cheio, retorna fallback imediatamente
+	// Isso evita que requests fiquem na fila até o timeout de 2001ms
+	select {
+	case sem <- struct{}{}:
+		fraudCount := knn5(vec)
+		<-sem
+		ctx.SetStatusCode(fasthttp.StatusOK)
+		ctx.SetContentTypeBytes([]byte("application/json"))
+		ctx.Write(knnResponses[fraudCount])
+	default:
+		ctx.SetStatusCode(fasthttp.StatusOK)
+		ctx.SetContentTypeBytes([]byte("application/json"))
+		ctx.Write(fallbackResponse)
+	}
 }
 
 func main() {
