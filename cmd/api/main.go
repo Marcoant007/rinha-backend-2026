@@ -12,26 +12,30 @@ import (
 	gojson "github.com/goccy/go-json"
 	"github.com/valyala/fasthttp"
 
-	"github.com/Marcoant007/rinha-2026/internal/kdtree"
+	"github.com/Marcoant007/rinha-2026/internal/ivf"
 	"github.com/Marcoant007/rinha-2026/internal/models"
 	"github.com/Marcoant007/rinha-2026/internal/vectorize"
 )
 
-// approvalThreshold: aprova somente se nenhum dos 5 vizinhos for fraude (0/5 = 0.0)
-// FN custa 3x mais que FP, então ser agressivo na detecção vale mais
+// approvalThreshold: approve only if 0 of 5 neighbours are fraud.
+// FN costs 3× more than FP, so be aggressive detecting fraud.
 const approvalThreshold = 0.1
 
 var (
-	idx       *kdtree.Index
+	idx       *ivf.Index
 	dataReady int32
 
-	// knnResponses[i] = JSON para fraudCount=i (i in 0..5), zero alloc por request
+	// knnResponses[i] = pre-built JSON for fraudCount=i (0..5), zero alloc.
 	knnResponses [6][]byte
 
-	// fallbackResponse: retornado durante loading ou erro de parse
+	// fallbackResponse: returned while loading or on parse errors.
 	fallbackResponse []byte
 
-	bufPool sync.Pool
+	// bodyPool reduces allocations for request body copying.
+	bodyPool sync.Pool
+
+	// reqPool reuses TransactionRequest structs, including KnownMerchants slice.
+	reqPool sync.Pool
 )
 
 func init() {
@@ -49,9 +53,12 @@ func init() {
 	}
 	fallbackResponse = []byte(`{"approved":true,"fraud_score":0.0}`)
 
-	bufPool.New = func() interface{} {
+	bodyPool.New = func() interface{} {
 		b := make([]byte, 0, 4096)
 		return &b
+	}
+	reqPool.New = func() interface{} {
+		return new(models.TransactionRequest)
 	}
 }
 
@@ -69,6 +76,7 @@ func handleFraudScore(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
+	// Serve a safe fallback while the index is loading.
 	if atomic.LoadInt32(&dataReady) == 0 {
 		ctx.SetStatusCode(fasthttp.StatusOK)
 		ctx.SetContentTypeBytes([]byte("application/json"))
@@ -76,28 +84,41 @@ func handleFraudScore(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	bufp := bufPool.Get().(*[]byte)
+	// Copy body via pooled buffer then unmarshal into a pooled request struct.
+	bufp := bodyPool.Get().(*[]byte)
 	body := ctx.PostBody()
 	*bufp = append((*bufp)[:0], body...)
 
-	var req models.TransactionRequest
-	err := gojson.Unmarshal(*bufp, &req)
-	bufPool.Put(bufp)
+	req := reqPool.Get().(*models.TransactionRequest)
+	err := gojson.Unmarshal(*bufp, req)
+	bodyPool.Put(bufp)
 
 	if err != nil {
+		merchants := req.Customer.KnownMerchants[:0]
+		*req = models.TransactionRequest{}
+		req.Customer.KnownMerchants = merchants
+		reqPool.Put(req)
+
 		ctx.SetStatusCode(fasthttp.StatusOK)
 		ctx.SetContentTypeBytes([]byte("application/json"))
 		ctx.Write(fallbackResponse)
 		return
 	}
 
-	vec64 := vectorize.Vectorize(&req)
-	var query [kdtree.Dims]float32
+	vec64 := vectorize.Vectorize(req)
+
+	// Return request to pool, preserving the KnownMerchants backing array.
+	merchants := req.Customer.KnownMerchants[:0]
+	*req = models.TransactionRequest{}
+	req.Customer.KnownMerchants = merchants
+	reqPool.Put(req)
+
+	var query [ivf.Dims]float32
 	for i, v := range vec64 {
 		query[i] = float32(v)
 	}
 
-	fraudCount := idx.Search(query, kdtree.VisitCap)
+	fraudCount := idx.Search(query)
 
 	ctx.SetStatusCode(fasthttp.StatusOK)
 	ctx.SetContentTypeBytes([]byte("application/json"))
@@ -112,20 +133,44 @@ func main() {
 		indexPath = "/data/index.bin"
 	}
 
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8081"
+	// Determine listen address: Unix socket (when INSTANCE_ID is set) or TCP.
+	instanceID := os.Getenv("INSTANCE_ID")
+	var ln net.Listener
+	var listenDesc string
+
+	if instanceID != "" {
+		sockPath := fmt.Sprintf("/tmp/sockets/api%s.sock", instanceID)
+		os.Remove(sockPath)
+		var err error
+		ln, err = net.Listen("unix", sockPath)
+		if err != nil {
+			log.Fatalf("unix listen %s: %v", sockPath, err)
+		}
+		os.Chmod(sockPath, 0777)
+		listenDesc = "unix:" + sockPath
+	} else {
+		port := os.Getenv("PORT")
+		if port == "" {
+			port = "8081"
+		}
+		var err error
+		ln, err = net.Listen("tcp", ":"+port)
+		if err != nil {
+			log.Fatalf("tcp listen :%s: %v", port, err)
+		}
+		listenDesc = "tcp::" + port
 	}
 
+	// Load the IVF index in the background; serve fallback until ready.
 	go func() {
-		log.Println("Carregando K-D Tree...")
+		log.Println("Loading IVF index...")
 		var err error
-		idx, err = kdtree.Load(indexPath)
+		idx, err = ivf.Load(indexPath)
 		if err != nil {
-			log.Fatalf("Erro ao carregar índice: %v", err)
+			log.Fatalf("failed to load IVF index: %v", err)
 		}
 		atomic.StoreInt32(&dataReady, 1)
-		log.Println("K-D Tree pronta!")
+		log.Println("IVF index ready!")
 	}()
 
 	requestHandler := func(ctx *fasthttp.RequestCtx) {
@@ -139,22 +184,17 @@ func main() {
 		}
 	}
 
-	ln, err := net.Listen("tcp", ":"+port)
-	if err != nil {
-		log.Fatalf("Erro ao escutar porta %s: %v", port, err)
-	}
-
+	// No Concurrency cap: fasthttp queues connections gracefully under load.
 	srv := &fasthttp.Server{
 		Handler:               requestHandler,
-		MaxRequestBodySize:    4096,
+		MaxRequestBodySize:    8192,
 		NoDefaultServerHeader: true,
 		NoDefaultContentType:  true,
 		ReadBufferSize:        4096,
 		WriteBufferSize:       4096,
-		Concurrency:           256,
 	}
 
-	log.Printf("api escutando na porta %s\n", port)
+	log.Printf("API listening on %s\n", listenDesc)
 	if err := srv.Serve(ln); err != nil {
 		log.Fatal(err)
 	}

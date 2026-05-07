@@ -3,7 +3,9 @@ WORKDIR /app
 COPY go.mod ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go run ./cmd/buildindex resources/references.json.gz index.bin
+# Build the IVF index from the reference vectors (replaces the old KD-tree)
+RUN CGO_ENABLED=0 go run ./cmd/buildivf resources/references.json.gz index.bin
+# Build the API binary
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -ldflags="-s -w" -o /api ./cmd/api
 
@@ -12,6 +14,5 @@ RUN apk add --no-cache ca-certificates
 COPY --from=builder /api /api
 COPY --from=builder /app/index.bin /data/index.bin
 ENV INDEX_PATH=/data/index.bin
-ENV PORT=8081
 EXPOSE 8081
 ENTRYPOINT ["/api"]
