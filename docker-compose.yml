@@ -1,46 +1,53 @@
-services:
-
-  api1:
-    image: ghcr.io/marcoant007/rinha-backend-2026-api:v11
-    environment:
-      - PORT=8081
-    networks:
-      - backend
-    deploy:
-      resources:
-        limits:
-          cpus: "0.45"
-          memory: "165MB"
-
-  api2:
-    image: ghcr.io/marcoant007/rinha-backend-2026-api:v11
-    environment:
-      - PORT=8081
-    networks:
-      - backend
-    deploy:
-      resources:
-        limits:
-          cpus: "0.45"
-          memory: "165MB"
-
-  nginx:
-    image: nginx:1.27-alpine
-    ports:
-      - "9999:9999"
-    volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-    networks:
-      - backend
-    depends_on:
-      - api1
-      - api2
-    deploy:
-      resources:
-        limits:
-          cpus: "0.05"
-          memory: "10MB"
+volumes:
+  sockets:
 
 networks:
   backend:
     driver: bridge
+
+services:
+  haproxy:
+    image: haproxy:3.3
+    ports:
+      - "9999:9999"
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - sockets:/tmp/sockets
+    depends_on:
+      - api1
+      - api2
+    networks:
+      - backend
+    deploy:
+      resources:
+        limits:
+          cpus: "0.15"
+          memory: "30MB"
+
+  api1:
+    image: ghcr.io/marcoant007/rinha-backend-2026-api:v12
+    environment:
+      - INSTANCE_ID=1
+    volumes:
+      - sockets:/tmp/sockets
+    networks:
+      - backend
+    deploy:
+      resources:
+        limits:
+          cpus: "0.40"
+          memory: "165MB"
+
+  api2:
+    image: ghcr.io/marcoant007/rinha-backend-2026-api:v12
+    environment:
+      - INSTANCE_ID=2
+    volumes:
+      - sockets:/tmp/sockets
+    networks:
+      - backend
+    deploy:
+      resources:
+        limits:
+          cpus: "0.40"
+          memory: "165MB"
