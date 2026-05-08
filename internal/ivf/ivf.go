@@ -11,8 +11,8 @@ import (
 const (
 	Dims   = 14
 	Nlist  = 256 // number of clusters
-	Nprobe = 10  // clusters to search per query
-	K      = 5   // nearest neighbours
+	Nprobe = 20  // clusters to search per query
+	K      = 7   // nearest neighbours
 	Scale  = 10000.0
 	Magic  = uint32(0x49564649) // "IVFI"
 )

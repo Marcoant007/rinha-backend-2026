@@ -17,16 +17,16 @@ import (
 	"github.com/Marcoant007/rinha-2026/internal/vectorize"
 )
 
-// approvalThreshold: approve only if 0 of 5 neighbours are fraud.
-// FN costs 3× more than FP, so be aggressive detecting fraud.
-const approvalThreshold = 0.1
+// approvalThreshold: approve if ≤1 of 7 neighbours are fraud (1/7≈0.143 < 0.2).
+// FN costs 3× more than FP; current FP/FN ratio is ~44:1, so relax slightly.
+const approvalThreshold = 0.2
 
 var (
 	idx       *ivf.Index
 	dataReady int32
 
-	// knnResponses[i] = pre-built JSON for fraudCount=i (0..5), zero alloc.
-	knnResponses [6][]byte
+	// knnResponses[i] = pre-built JSON for fraudCount=i (0..7), zero alloc.
+	knnResponses [8][]byte
 
 	// fallbackResponse: returned while loading or on parse errors.
 	fallbackResponse []byte
@@ -39,8 +39,8 @@ var (
 )
 
 func init() {
-	for i := 0; i <= 5; i++ {
-		score := float64(i) / 5.0
+	for i := 0; i <= 7; i++ {
+		score := float64(i) / 7.0
 		approved := score < approvalThreshold
 		appr := "false"
 		if approved {
