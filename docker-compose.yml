@@ -25,7 +25,7 @@ services:
           memory: "20MB"
 
   api1:
-    image: ghcr.io/marcoant007/rinha-backend-2026-api:v14
+    image: ghcr.io/marcoant007/rinha-backend-2026-api:v15
     environment:
       - INSTANCE_ID=1
     volumes:
@@ -39,7 +39,7 @@ services:
           memory: "162MB"
 
   api2:
-    image: ghcr.io/marcoant007/rinha-backend-2026-api:v14
+    image: ghcr.io/marcoant007/rinha-backend-2026-api:v15
     environment:
       - INSTANCE_ID=2
     volumes:
