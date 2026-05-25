@@ -2,30 +2,150 @@ package ivf
 
 import (
 	"bufio"
-	"encoding/binary"
 	"fmt"
+	"io"
 	"math"
 	"os"
+	"unsafe"
 )
 
 const (
-	Dims   = 14
-	Nlist  = 256 // number of clusters
-	Nprobe = 20  // clusters to search per query
-	K      = 7   // nearest neighbours
-	Scale  = 10000.0
-	Magic  = uint32(0x49564649) // "IVFI"
+	Dims       = 14
+	Nclusters  = 4096
+	KNN        = 5
+	QuantScale = float32(10000)
+
+	FastNProbe  = 2
+	BboxLanes   = 16 // 14 real dims + 2 zero-padding
+	BlockLanes  = 8
+	BlockStride = Dims * BlockLanes // 112 int16s per block
 )
 
-// Index holds the clustered reference vectors.
-type Index struct {
-	nlist     int
-	centroids []float32 // nlist * Dims
-	offsets   []uint32  // nlist + 1
-	vectors   []int16   // n * Dims, sorted by cluster
-	labels    []byte    // bit-packed fraud labels, sorted by cluster
-	n         int
+// magicV2 identifies the IVF2 binary format.
+const magicV2 = "IVF2"
+
+// BinaryMagic returns the 4-byte magic used in the IVF2 file header.
+// Exported so cmd/buildivf can write a consistent header.
+func BinaryMagic() []byte { return []byte(magicV2) }
+
+// ExtremeWorstThreshold[c] is the i64 squared-distance above which a fast-tier
+// result with fraudCount==c triggers a full sweep. 0 = disabled (trust fast tier).
+// Calibrate with cmd/calibrate after building a new index.
+var ExtremeWorstThreshold = [KNN + 1]int64{
+	/* count=0 */ 0,
+	/* count=1 */ 0,
+	/* count=2 */ 0, // always escalate via count gate
+	/* count=3 */ 0, // always escalate via count gate
+	/* count=4 */ 0, // always escalate via count gate
+	/* count=5 */ 0,
 }
+
+// Index is the runtime IVF index loaded from the binary produced by cmd/buildivf.
+type Index struct {
+	N         uint32
+	K         uint32    // == Nclusters
+	Blocks    uint32    // total block count across all clusters
+	Centroids []float32 // AoS: Centroids[c*Dims+d], in QuantScale space
+	Offsets   []uint32  // length K+1, in block units
+	BboxMin   []int16   // cluster-major: BboxMin[c*BboxLanes+d]
+	BboxMax   []int16   // same layout as BboxMin
+	Radii     []float32 // length K, computed at load (not serialised)
+	Labels    []uint8   // Labels[block*BlockLanes+lane], 1=fraud
+	BlockData []int16   // BlockData[block*BlockStride + d*BlockLanes + lane]
+}
+
+// Scratch holds per-request reusable buffers. Allocate one from a sync.Pool.
+type Scratch struct {
+	CentroidDists [Nclusters]float32
+	Picked        [FastNProbe]uint16
+	Scanned       [Nclusters / 64]uint64
+	top           top5
+}
+
+// NewScratch returns a freshly initialised Scratch for use in a sync.Pool.
+func NewScratch() *Scratch { return &Scratch{} }
+
+// ---------------------------------------------------------------------------
+// top-5 max-heap (worst distance at index 0)
+// ---------------------------------------------------------------------------
+
+type top5 struct {
+	dist  [KNN]int64
+	label [KNN]uint8
+	count int
+}
+
+func (t *top5) reset() {
+	t.count = 0
+	for i := range t.dist {
+		t.dist[i] = math.MaxInt64
+	}
+}
+
+func (t *top5) worst() int64 {
+	if t.count < KNN {
+		return math.MaxInt64
+	}
+	return t.dist[0]
+}
+
+func (t *top5) worstF32() float32 {
+	w := t.worst()
+	if w == math.MaxInt64 {
+		return math.MaxFloat32
+	}
+	return float32(w)
+}
+
+func (t *top5) insert(d int64, label uint8) {
+	if t.count < KNN {
+		t.dist[t.count] = d
+		t.label[t.count] = label
+		t.count++
+		if t.count == KNN {
+			for i := KNN/2 - 1; i >= 0; i-- {
+				top5SiftDown(t, i)
+			}
+		}
+		return
+	}
+	if d >= t.dist[0] {
+		return
+	}
+	t.dist[0] = d
+	t.label[0] = label
+	top5SiftDown(t, 0)
+}
+
+func top5SiftDown(t *top5, i int) {
+	for {
+		l, r, largest := 2*i+1, 2*i+2, i
+		if l < KNN && t.dist[l] > t.dist[largest] {
+			largest = l
+		}
+		if r < KNN && t.dist[r] > t.dist[largest] {
+			largest = r
+		}
+		if largest == i {
+			break
+		}
+		t.dist[i], t.dist[largest] = t.dist[largest], t.dist[i]
+		t.label[i], t.label[largest] = t.label[largest], t.label[i]
+		i = largest
+	}
+}
+
+func (t *top5) fraudCount() uint8 {
+	var c uint8
+	for i := 0; i < t.count; i++ {
+		c += t.label[i]
+	}
+	return c
+}
+
+// ---------------------------------------------------------------------------
+// Load
+// ---------------------------------------------------------------------------
 
 // Load reads an IVF index from the binary file produced by cmd/buildivf.
 func Load(path string) (*Index, error) {
@@ -37,154 +157,246 @@ func Load(path string) (*Index, error) {
 
 	r := bufio.NewReaderSize(f, 8<<20)
 
-	var m uint32
-	if err := binary.Read(r, binary.LittleEndian, &m); err != nil {
-		return nil, err
+	// Header: magic(4) + version(4) + N(4) + K(4) + Blocks(4) + pad(12) = 32 bytes
+	var hdr [32]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return nil, fmt.Errorf("read header: %w", err)
 	}
-	if m != Magic {
-		return nil, fmt.Errorf("invalid IVF index: bad magic %08x", m)
+	if string(hdr[0:4]) != magicV2 {
+		return nil, fmt.Errorf("bad magic %q (want %q)", hdr[0:4], magicV2)
+	}
+	// hdr[4:8] = version (unused for now)
+	idx := &Index{
+		N:      le32(hdr[8:]),
+		K:      le32(hdr[12:]),
+		Blocks: le32(hdr[16:]),
 	}
 
-	var nl, n uint32
-	binary.Read(r, binary.LittleEndian, &nl)
-	binary.Read(r, binary.LittleEndian, &n)
+	K := int(idx.K)
+	blocks := int(idx.Blocks)
 
-	centroids := make([]float32, int(nl)*Dims)
-	binary.Read(r, binary.LittleEndian, centroids)
+	idx.Centroids = make([]float32, K*Dims)
+	if err := readF32(r, idx.Centroids); err != nil {
+		return nil, fmt.Errorf("centroids: %w", err)
+	}
+	idx.Offsets = make([]uint32, K+1)
+	if err := readU32(r, idx.Offsets); err != nil {
+		return nil, fmt.Errorf("offsets: %w", err)
+	}
+	idx.BboxMin = make([]int16, K*BboxLanes)
+	if err := readI16(r, idx.BboxMin); err != nil {
+		return nil, fmt.Errorf("bboxMin: %w", err)
+	}
+	idx.BboxMax = make([]int16, K*BboxLanes)
+	if err := readI16(r, idx.BboxMax); err != nil {
+		return nil, fmt.Errorf("bboxMax: %w", err)
+	}
+	idx.Labels = make([]uint8, blocks*BlockLanes)
+	if _, err := io.ReadFull(r, idx.Labels); err != nil {
+		return nil, fmt.Errorf("labels: %w", err)
+	}
+	idx.BlockData = make([]int16, blocks*BlockStride)
+	if err := readI16(r, idx.BlockData); err != nil {
+		return nil, fmt.Errorf("blockdata: %w", err)
+	}
 
-	offsets := make([]uint32, int(nl)+1)
-	binary.Read(r, binary.LittleEndian, offsets)
-
-	vectors := make([]int16, int(n)*Dims)
-	binary.Read(r, binary.LittleEndian, vectors)
-
-	labelCount := (int(n) + 7) / 8
-	labels := make([]byte, labelCount)
-	binary.Read(r, binary.LittleEndian, labels)
-
-	return &Index{
-		nlist:     int(nl),
-		centroids: centroids,
-		offsets:   offsets,
-		vectors:   vectors,
-		labels:    labels,
-		n:         int(n),
-	}, nil
+	computeRadii(idx)
+	return idx, nil
 }
 
-// Search returns the number of fraud neighbors (0..K) among the K nearest
-// vectors found via IVF approximate search.
-func (idx *Index) Search(query [Dims]float32) int {
-	// 1. Find top Nprobe centroids (linear scan, tiny: 256 × 14 floats)
-	var topCells [Nprobe]int
-	var topDists [Nprobe]float32
-	for i := range topDists {
-		topDists[i] = math.MaxFloat32
-	}
-
-	for i := 0; i < idx.nlist; i++ {
-		off := i * Dims
-		d0 := query[0] - idx.centroids[off+0]
-		d1 := query[1] - idx.centroids[off+1]
-		d2 := query[2] - idx.centroids[off+2]
-		d3 := query[3] - idx.centroids[off+3]
-		d4 := query[4] - idx.centroids[off+4]
-		d5 := query[5] - idx.centroids[off+5]
-		d6 := query[6] - idx.centroids[off+6]
-		d7 := query[7] - idx.centroids[off+7]
-		d8 := query[8] - idx.centroids[off+8]
-		d9 := query[9] - idx.centroids[off+9]
-		d10 := query[10] - idx.centroids[off+10]
-		d11 := query[11] - idx.centroids[off+11]
-		d12 := query[12] - idx.centroids[off+12]
-		d13 := query[13] - idx.centroids[off+13]
-		d := d0*d0 + d1*d1 + d2*d2 + d3*d3 + d4*d4 + d5*d5 + d6*d6 +
-			d7*d7 + d8*d8 + d9*d9 + d10*d10 + d11*d11 + d12*d12 + d13*d13
-
-		if d < topDists[Nprobe-1] {
-			pos := Nprobe - 1
-			for pos > 0 && d < topDists[pos-1] {
-				topDists[pos] = topDists[pos-1]
-				topCells[pos] = topCells[pos-1]
-				pos--
-			}
-			topDists[pos] = d
-			topCells[pos] = i
-		}
-	}
-
-	// 2. Quantize query to int16
-	var q [Dims]int16
-	for i, v := range query {
-		if v < 0 {
-			q[i] = int16(v*Scale - 0.5)
-		} else {
-			q[i] = int16(v*Scale + 0.5)
-		}
-	}
-
-	// 3. Scan top clusters, maintain K-nearest heap (max-dist at index 0)
-	var topDist [K]uint64
-	var topIdx [K]int
-	for i := range topDist {
-		topDist[i] = math.MaxUint64
-	}
-
-	for _, cellID := range topCells {
-		start := int(idx.offsets[cellID])
-		end := int(idx.offsets[cellID+1])
-
-		for i := start; i < end; i++ {
-			off := i * Dims
-
-			// Compute first 7 dims; early exit before full distance
-			v0 := int32(idx.vectors[off+0]) - int32(q[0])
-			v1 := int32(idx.vectors[off+1]) - int32(q[1])
-			v2 := int32(idx.vectors[off+2]) - int32(q[2])
-			v3 := int32(idx.vectors[off+3]) - int32(q[3])
-			v4 := int32(idx.vectors[off+4]) - int32(q[4])
-			v5 := int32(idx.vectors[off+5]) - int32(q[5])
-			v6 := int32(idx.vectors[off+6]) - int32(q[6])
-			dist := uint64(v0*v0) + uint64(v1*v1) + uint64(v2*v2) + uint64(v3*v3) +
-				uint64(v4*v4) + uint64(v5*v5) + uint64(v6*v6)
-
-			if dist >= topDist[K-1] {
-				continue
-			}
-
-			v7 := int32(idx.vectors[off+7]) - int32(q[7])
-			v8 := int32(idx.vectors[off+8]) - int32(q[8])
-			v9 := int32(idx.vectors[off+9]) - int32(q[9])
-			v10 := int32(idx.vectors[off+10]) - int32(q[10])
-			v11 := int32(idx.vectors[off+11]) - int32(q[11])
-			v12 := int32(idx.vectors[off+12]) - int32(q[12])
-			v13 := int32(idx.vectors[off+13]) - int32(q[13])
-			dist += uint64(v7*v7) + uint64(v8*v8) + uint64(v9*v9) + uint64(v10*v10) +
-				uint64(v11*v11) + uint64(v12*v12) + uint64(v13*v13)
-
-			if dist < topDist[K-1] {
-				pos := K - 1
-				for pos > 0 && dist < topDist[pos-1] {
-					topDist[pos] = topDist[pos-1]
-					topIdx[pos] = topIdx[pos-1]
-					pos--
-				}
-				topDist[pos] = dist
-				topIdx[pos] = i
-			}
-		}
-	}
-
-	// 4. Count fraud among K nearest
-	fraudCount := 0
-	for i := 0; i < K; i++ {
-		if topDist[i] == math.MaxUint64 {
+func computeRadii(idx *Index) {
+	K := int(idx.K)
+	idx.Radii = make([]float32, K)
+	for c := 0; c < K; c++ {
+		cBase := c * Dims
+		start := idx.Offsets[c]
+		end := idx.Offsets[c+1]
+		if start == end {
 			continue
 		}
-		vi := topIdx[i]
-		if (idx.labels[vi/8] & (1 << uint(vi%8))) != 0 {
-			fraudCount++
+		var maxSq float32
+		for b := start; b < end; b++ {
+			bb := int(b) * BlockStride
+			for lane := 0; lane < BlockLanes; lane++ {
+				var sq float32
+				for d := 0; d < Dims; d++ {
+					v := float32(idx.BlockData[bb+d*BlockLanes+lane])
+					diff := v - idx.Centroids[cBase+d]
+					sq += diff * diff
+				}
+				if sq > maxSq {
+					maxSq = sq
+				}
+			}
+		}
+		idx.Radii[c] = float32(math.Sqrt(float64(maxSq)))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Search
+// ---------------------------------------------------------------------------
+
+// Search returns the number of fraud neighbors (0..KNN) among the KNN nearest
+// reference vectors found via IVF search with class-conditional escalation.
+//
+// qf must be the float32 query in QuantScale (10000) space.
+// qi must be the int16 quantization of the same vector.
+// scratch must not be shared across goroutines.
+func (idx *Index) Search(qf *[Dims]float32, qi *[Dims]int16, scratch *Scratch) int {
+	K := int(idx.K)
+
+	// 1. Score all K centroids in float32 (QuantScale) space.
+	for c := 0; c < K; c++ {
+		base := c * Dims
+		var d float32
+		for dd := 0; dd < Dims; dd++ {
+			x := qf[dd] - idx.Centroids[base+dd]
+			d += x * x
+		}
+		scratch.CentroidDists[c] = d
+	}
+
+	// 2. Pick the top FastNProbe closest centroids.
+	pickTop2(scratch.CentroidDists[:K], &scratch.Picked)
+
+	// 3. Reset.
+	scratch.top.reset()
+	for i := range scratch.Scanned {
+		scratch.Scanned[i] = 0
+	}
+
+	// 4. Fast tier: scan the closest FastNProbe clusters.
+	for i := 0; i < FastNProbe; i++ {
+		c := scratch.Picked[i]
+		if c == ^uint16(0) {
+			break
+		}
+		scanCluster(c, qi, idx, &scratch.top)
+		scratch.Scanned[c/64] |= 1 << (c % 64)
+	}
+
+	// 5. Escalation check.
+	count := scratch.top.fraudCount()
+	needSweep := count == 2 || count == 3 || count == 4
+	if !needSweep {
+		thr := ExtremeWorstThreshold[count]
+		if thr > 0 && scratch.top.worst() > thr {
+			needSweep = true
 		}
 	}
-	return fraudCount
+	if !needSweep {
+		return int(count)
+	}
+
+	// 6. Full sweep: triangle-inequality LB + AABB LB prune, then scan.
+	for c := uint16(0); c < uint16(K); c++ {
+		if scratch.Scanned[c/64]&(1<<(c%64)) != 0 {
+			continue
+		}
+		// Triangle inequality: dist(q,x) >= (sqrt(centDist) - radius)²
+		cd := scratch.CentroidDists[c]
+		if cd > 0 {
+			gap := float32(math.Sqrt(float64(cd))) - idx.Radii[c]
+			if gap > 0 && gap*gap >= scratch.top.worstF32() {
+				continue
+			}
+		}
+		// AABB lower bound.
+		if aabbLB(qi, idx.BboxMin, idx.BboxMax, int(c)) >= scratch.top.worst() {
+			continue
+		}
+		scanCluster(c, qi, idx, &scratch.top)
+	}
+
+	return int(scratch.top.fraudCount())
+}
+
+func pickTop2(dists []float32, out *[FastNProbe]uint16) {
+	out[0] = ^uint16(0)
+	out[1] = ^uint16(0)
+	d0, d1 := float32(math.MaxFloat32), float32(math.MaxFloat32)
+	for i, d := range dists {
+		if d < d0 {
+			d1, out[1] = d0, out[0]
+			d0, out[0] = d, uint16(i)
+		} else if d < d1 {
+			d1, out[1] = d, uint16(i)
+		}
+	}
+}
+
+func aabbLB(qi *[Dims]int16, bboxMin, bboxMax []int16, c int) int64 {
+	base := c * BboxLanes
+	var lb int64
+	for d := 0; d < Dims; d++ {
+		q := int64(qi[d])
+		mn := int64(bboxMin[base+d])
+		mx := int64(bboxMax[base+d])
+		if q < mn {
+			diff := mn - q
+			lb += diff * diff
+		} else if q > mx {
+			diff := q - mx
+			lb += diff * diff
+		}
+	}
+	return lb
+}
+
+func scanCluster(c uint16, qi *[Dims]int16, idx *Index, top *top5) {
+	start := int(idx.Offsets[c])
+	end := int(idx.Offsets[c+1])
+
+	for b := start; b < end; b++ {
+		bb := b * BlockStride
+		lb := b * BlockLanes
+		worst := top.worst()
+
+		for lane := 0; lane < BlockLanes; lane++ {
+			// Early exit on first 7 dims.
+			var ssd int64
+			for d := 0; d < 7; d++ {
+				diff := int64(qi[d]) - int64(idx.BlockData[bb+d*BlockLanes+lane])
+				ssd += diff * diff
+			}
+			if ssd >= worst {
+				continue
+			}
+			for d := 7; d < Dims; d++ {
+				diff := int64(qi[d]) - int64(idx.BlockData[bb+d*BlockLanes+lane])
+				ssd += diff * diff
+			}
+			if ssd < worst {
+				top.insert(ssd, idx.Labels[lb+lane])
+				worst = top.worst()
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Binary I/O helpers
+// ---------------------------------------------------------------------------
+
+func le32(b []byte) uint32 {
+	return uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24
+}
+
+func readF32(r io.Reader, s []float32) error {
+	b := unsafe.Slice((*byte)(unsafe.Pointer(unsafe.SliceData(s))), 4*len(s))
+	_, err := io.ReadFull(r, b)
+	return err
+}
+
+func readU32(r io.Reader, s []uint32) error {
+	b := unsafe.Slice((*byte)(unsafe.Pointer(unsafe.SliceData(s))), 4*len(s))
+	_, err := io.ReadFull(r, b)
+	return err
+}
+
+func readI16(r io.Reader, s []int16) error {
+	b := unsafe.Slice((*byte)(unsafe.Pointer(unsafe.SliceData(s))), 2*len(s))
+	_, err := io.ReadFull(r, b)
+	return err
 }

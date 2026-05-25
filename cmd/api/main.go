@@ -17,33 +17,29 @@ import (
 	"github.com/Marcoant007/rinha-2026/internal/vectorize"
 )
 
-// approvalThreshold: approve if ≤1 of 7 neighbours are fraud (1/7≈0.143 < 0.2).
-// FN costs 3× more than FP; current FP/FN ratio is ~44:1, so relax slightly.
-const approvalThreshold = 0.2
+// approvalThreshold: approve if fraudScore < 0.5 → fraudCount ≤ 2 out of 5 (majority vote).
+const approvalThreshold = 0.5
 
 var (
 	idx       *ivf.Index
 	dataReady int32
 
-	// knnResponses[i] = pre-built JSON for fraudCount=i (0..7), zero alloc.
-	knnResponses [8][]byte
+	// knnResponses[i] = pre-built JSON for fraudCount=i (0..KNN), zero alloc.
+	knnResponses [ivf.KNN + 1][]byte
 
 	// fallbackResponse: returned while loading or on parse errors.
 	fallbackResponse []byte
 
-	// bodyPool reduces allocations for request body copying.
-	bodyPool sync.Pool
-
-	// reqPool reuses TransactionRequest structs, including KnownMerchants slice.
-	reqPool sync.Pool
+	bodyPool    sync.Pool
+	reqPool     sync.Pool
+	scratchPool sync.Pool
 )
 
 func init() {
-	for i := 0; i <= 7; i++ {
-		score := float64(i) / 7.0
-		approved := score < approvalThreshold
+	for i := 0; i <= ivf.KNN; i++ {
+		score := float64(i) / float64(ivf.KNN)
 		appr := "false"
-		if approved {
+		if score < approvalThreshold {
 			appr = "true"
 		}
 		knnResponses[i] = fmt.Appendf(nil,
@@ -59,6 +55,9 @@ func init() {
 	}
 	reqPool.New = func() interface{} {
 		return new(models.TransactionRequest)
+	}
+	scratchPool.New = func() interface{} {
+		return ivf.NewScratch()
 	}
 }
 
@@ -76,7 +75,6 @@ func handleFraudScore(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	// Serve a safe fallback while the index is loading.
 	if atomic.LoadInt32(&dataReady) == 0 {
 		ctx.SetStatusCode(fasthttp.StatusOK)
 		ctx.SetContentTypeBytes([]byte("application/json"))
@@ -84,7 +82,6 @@ func handleFraudScore(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	// Copy body via pooled buffer then unmarshal into a pooled request struct.
 	bufp := bodyPool.Get().(*[]byte)
 	body := ctx.PostBody()
 	*bufp = append((*bufp)[:0], body...)
@@ -105,20 +102,29 @@ func handleFraudScore(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	vec64 := vectorize.Vectorize(req)
+	vec := vectorize.Vectorize(req)
 
-	// Return request to pool, preserving the KnownMerchants backing array.
 	merchants := req.Customer.KnownMerchants[:0]
 	*req = models.TransactionRequest{}
 	req.Customer.KnownMerchants = merchants
 	reqPool.Put(req)
 
-	var query [ivf.Dims]float32
-	for i, v := range vec64 {
-		query[i] = float32(v)
+	// Convert [0,1] float64 → QuantScale float32 (qf) and int16 (qi).
+	var qf [ivf.Dims]float32
+	var qi [ivf.Dims]int16
+	for i, v := range vec {
+		f := float32(v) * ivf.QuantScale
+		qf[i] = f
+		if f < 0 {
+			qi[i] = int16(f - 0.5)
+		} else {
+			qi[i] = int16(f + 0.5)
+		}
 	}
 
-	fraudCount := idx.Search(query)
+	scratch := scratchPool.Get().(*ivf.Scratch)
+	fraudCount := idx.Search(&qf, &qi, scratch)
+	scratchPool.Put(scratch)
 
 	ctx.SetStatusCode(fasthttp.StatusOK)
 	ctx.SetContentTypeBytes([]byte("application/json"))
@@ -133,7 +139,6 @@ func main() {
 		indexPath = "/data/index.bin"
 	}
 
-	// Determine listen address: Unix socket (when INSTANCE_ID is set) or TCP.
 	instanceID := os.Getenv("INSTANCE_ID")
 	var ln net.Listener
 	var listenDesc string
@@ -161,7 +166,6 @@ func main() {
 		listenDesc = "tcp::" + port
 	}
 
-	// Load the IVF index in the background; serve fallback until ready.
 	go func() {
 		log.Println("Loading IVF index...")
 		var err error
@@ -184,7 +188,6 @@ func main() {
 		}
 	}
 
-	// No Concurrency cap: fasthttp queues connections gracefully under load.
 	srv := &fasthttp.Server{
 		Handler:               requestHandler,
 		MaxRequestBodySize:    8192,
