@@ -32,12 +32,12 @@ func BinaryMagic() []byte { return []byte(magicV2) }
 // result with fraudCount==c triggers a full sweep. 0 = disabled (trust fast tier).
 // Calibrate with cmd/calibrate after building a new index.
 var ExtremeWorstThreshold = [KNN + 1]int64{
-	/* count=0 */ 0,
-	/* count=1 */ 0,
-	/* count=2 */ 0, // always escalate via count gate
-	/* count=3 */ 0, // always escalate via count gate
-	/* count=4 */ 0, // always escalate via count gate
-	/* count=5 */ 0,
+	/* count=0 */ 92128083, // escalate if neighbors are far (uncertain legit)
+	/* count=1 */ 4592068,  // escalate if neighbors are far (uncertain near-legit)
+	/* count=2 */ 0,        // always escalate via count gate
+	/* count=3 */ 0,        // always escalate via count gate
+	/* count=4 */ 0,        // always escalate via count gate
+	/* count=5 */ 91459358, // escalate if neighbors are far (uncertain fraud)
 }
 
 // Index is the runtime IVF index loaded from the binary produced by cmd/buildivf.
