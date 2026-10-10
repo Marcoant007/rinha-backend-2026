@@ -1,4 +1,6 @@
 # Rinha de Backend 2026 — Detecção de Fraudes (Go)
+<img width="1205" height="398" alt="image" src="https://github.com/user-attachments/assets/3cd3c401-3bc0-45d7-acb2-f4104c706811" />
+
 
 Implementação em Go para a [Rinha de Backend 2026](https://github.com/zanfranceschi/rinha-de-backend-2026), cujo tema é detecção de fraudes em transações financeiras usando busca vetorial KNN.
 
